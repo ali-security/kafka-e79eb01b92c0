@@ -16,13 +16,19 @@
  */
 package org.apache.kafka.common.requests;
 
+import org.apache.kafka.common.errors.InvalidRequestException;
+import org.apache.kafka.common.message.RequestHeaderData;
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.ByteBufferAccessor;
 import org.apache.kafka.common.protocol.ObjectSerializationCache;
+import org.apache.kafka.common.utils.ByteUtils;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class RequestHeaderTest {
 
@@ -92,5 +98,42 @@ public class RequestHeaderTest {
 
         RequestHeader parsed = RequestHeader.parse(buffer);
         assertEquals(header, parsed);
+    }
+
+    @Test
+    public void testHugeDeclaredTaggedFieldCountIsRejected() {
+        // FindCoordinator v3 is flexible, so it uses request header version 2 (tagged fields)
+        RequestHeaderData headerData = new RequestHeaderData().
+            setClientId("client").
+            setCorrelationId(123).
+            setRequestApiKey(ApiKeys.FIND_COORDINATOR.id).
+            setRequestApiVersion((short) 3);
+        ObjectSerializationCache serializationCache = new ObjectSerializationCache();
+        ByteBuffer prefix = ByteBuffer.allocate(headerData.size(serializationCache, (short) 2));
+        headerData.write(new ByteBufferAccessor(prefix), serializationCache, (short) 2);
+        prefix.flip();
+        byte[] prefixBytes = new byte[prefix.remaining() - 1];
+        prefix.get(prefixBytes);
+        assertEquals((byte) 0, prefix.get(), "expected an empty tagged-fields section to replace");
+
+        int declaredCount = 20_000_000;
+        ByteBuffer countBuf = ByteBuffer.allocate(8);
+        ByteUtils.writeUnsignedVarint(declaredCount, countBuf);
+        countBuf.flip();
+        byte[] countBytes = new byte[countBuf.remaining()];
+        countBuf.get(countBytes);
+
+        // Real buffer backed by declaredCount padding bytes, so the pre-existing
+        // count-vs-remaining-bytes guard alone would let this through and the new hard cap is
+        // what has to catch it.
+        ByteBuffer buffer = ByteBuffer.allocate(prefixBytes.length + countBytes.length + declaredCount);
+        buffer.put(prefixBytes);
+        buffer.put(countBytes);
+        buffer.position(prefixBytes.length + countBytes.length + declaredCount);
+        buffer.flip();
+
+        InvalidRequestException e = assertThrows(InvalidRequestException.class, () -> RequestHeader.parse(buffer));
+        assertTrue(e.getCause().getMessage().contains("exceeds the maximum allowed count"),
+                "Expected a hard-cap rejection, but got: " + e.getCause().getMessage());
     }
 }
